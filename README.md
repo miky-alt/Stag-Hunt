@@ -2,6 +2,16 @@
 
 DISCLAIMER: This repository is a fork of the original Gym-Stag-Hunt to update it to the most recent versions of the used libraries (e.g., Numpy) and to migrate from Gym to Gymnasium. This should facilitate the adoption, removing the need for specific, older packages.
 
+## Custom Training
+
+The custom trainer is located at `Autonomus_Project/training/train.py` and can be started from the `Autonomus_Project` directory with:
+
+```bash
+python -m training.train
+```
+
+The previous trainer is preserved in `Autonomus_Project/legacy/train_old.py` for reference and recovery. Training checkpoints, logs, virtual environments, backups, and local planning files are excluded by `.gitignore`.
+
 What follows is the original Readme, preserved so you can get the full context of the original repo and research behind it. Some of the reported arguments have been renamed (e.g., episodes_per_game has become max_timesteps) and others have changed a little bit, so I suggest you to check the actual code in case of doubts.
 
 
