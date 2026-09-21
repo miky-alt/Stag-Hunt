@@ -1,0 +1,29 @@
+*.pyc
+.idea
+/logs
+*~
+Pipfile
+Pipfile.lock
+*.egg-info/
+build
+
+# Local Python environments and caches
+venv/
+.venv/
+env/
+__pycache__/
+.pytest_cache/
+.mypy_cache/
+.ipynb_checkpoints/
+
+# Training outputs and local experiments
+checkpoints/
+backup/
+logs_csv/
+*.log
+log_addestramento.txt
+
+# Local planning and environment files
+toDo.txt
+todo.txt
+.env
