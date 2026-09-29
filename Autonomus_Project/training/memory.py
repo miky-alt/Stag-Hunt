@@ -2,7 +2,7 @@ from tf_agents.replay_buffers import tf_uniform_replay_buffer
 from tf_agents.policies import actor_policy # Add the actor policy import.
 
 class MemoryManager:
-    def __init__(self, tf_env, agent, max_length: int = 65):
+    def __init__(self, tf_env, agent, max_length: int = 260):
         """
         Initializes the memory components for ON-POLICY training.
         """

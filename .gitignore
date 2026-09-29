@@ -17,11 +17,22 @@ __pycache__/
 .ipynb_checkpoints/
 
 # Training outputs and local experiments
+# Anchored to the real experiments path (Autonomus_Project/experiments/),
+# recursive so it also covers multi-seed groups under runs/seed_<seed>/.
+Autonomus_Project/experiments/**/*
+!Autonomus_Project/experiments/**/
+!Autonomus_Project/experiments/**/metadata.json
+!Autonomus_Project/experiments/**/README.md
+!Autonomus_Project/experiments/**/evaluation_results.json
+!Autonomus_Project/experiments/**/training_results.json
 checkpoints/
 backup/
 logs_csv/
+training_logs/
+episode_logs/
 *.log
 log_addestramento.txt
+training_log.txt
 
 # Local planning and environment files
 toDo.txt

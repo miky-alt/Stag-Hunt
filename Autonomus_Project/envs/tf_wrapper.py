@@ -1,6 +1,7 @@
 import os
 os.environ["TF_USE_LEGACY_KERAS"] = "1"
 
+import random
 import gymnasium as gym
 import numpy as np
 import gymnasium_stag_hunt
@@ -23,6 +24,7 @@ class TFStagHuntWrapper(py_environment.PyEnvironment):
         }
         
         self.render_mode = kwargs.pop('render_mode', None)
+        self._initial_seed = kwargs.pop('seed', None)
         configs.update(kwargs)
 
         self.env = gym.make(env_name, **configs)
@@ -123,7 +125,13 @@ class TFStagHuntWrapper(py_environment.PyEnvironment):
         return np.concatenate([flat_observation, radar_features], axis=0)
     
     def _reset(self):
-        obs, info = self.env.reset()
+        if self._initial_seed is not None:
+            random.seed(self._initial_seed)
+            np.random.seed(self._initial_seed)
+            obs, info = self.env.reset(seed=self._initial_seed)
+            self._initial_seed = None
+        else:
+            obs, info = self.env.reset()
         #time.sleep(1) 
         
         obs_A_enhanced = self._inject_geometric_radar(obs[0])

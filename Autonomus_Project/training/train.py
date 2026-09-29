@@ -3,261 +3,117 @@ import os
 os.environ["TF_USE_LEGACY_KERAS"] = "1" 
 os.environ["TF_ENABLE_ONEDNN_OPTS"] = "0"
 
-import sys
 import gc
-import time
-import csv
-import io
+import argparse
+import hashlib
+import json
+from datetime import datetime
+from pathlib import Path
 import numpy as np
 import tensorflow as tf
-import matplotlib.pyplot as plt
-from dataclasses import dataclass
+from dataclasses import replace
 
-from tf_agents.environments import wrappers, tf_py_environment
+from tf_agents.environments import tf_py_environment
 from tf_agents.utils import common
-from tf_agents.trajectories import trajectory
-from tf_agents.trajectories.policy_step import PolicyStep
 
 # Import our custom modules
 from envs.tf_wrapper import TFStagHuntWrapper
 from agents.networks import ActorNetwork, CriticNetwork
 from agents.ppo_custom import CustomPPO
+from training.config import TrainingConfig
 from training.memory import MemoryManager
+from training.rollouts import collect_rollout, train_ppo_epochs
+from training.scheduling import EntropyScheduler
+from training.visualization import generate_annotated_heatmap
 
 
-# ==========================================
-# 1. CONFIGURATION (Goodbye Magic Numbers)
-# ==========================================
-@dataclass
-class TrainingConfig:
-    """Stores all training hyperparameters and configuration values."""
-    num_iterations: int = 16_000
-    rollout_steps: int = 260
-    ppo_epochs: int = 4
-    curriculum_threshold: int = 3750
-    log_interval: int = 200
-    save_interval: int = 100
-    map_size: int = 5
-    
-    # Agent hyperparameters
-    learning_rate: float = 3e-4
-    clip_epsilon: float = 0.2
-    
-    # Entropy
-    entropy_start: float = 0.15
-    entropy_end: float = 0.01
-    entropy_decay_steps: int = 10000
+def _find_convergence_iteration(training_metrics, config, reward_key='return'):
+    """Return the first 1-based iteration with a stable good reward rate."""
+    steps_per_rollout = max(config.rollout_steps - 1, 1)
+    rewards = np.asarray(
+        [metric[reward_key] / steps_per_rollout for metric in training_metrics],
+        dtype=float,
+    )
+    window = config.convergence_window
+    if len(rewards) < window:
+        return None
+
+    for end_index in range(window, len(rewards) + 1):
+        reward_window = rewards[end_index - window:end_index]
+        if (
+            np.all(reward_window >= config.convergence_reward_rate)
+            and np.std(reward_window) <= config.convergence_max_rate_std
+        ):
+            return end_index
+    return None
 
 
-# ==========================================
-# 2. UTILITIES E CLASSI DI SUPPORTO
-# ==========================================
-class BlackBoxLogger:
-    """Stores local episode logs and the grid's physical state data."""
-    def __init__(self, log_dir="./logs_csv", map_size=(5, 5)):
-        self.log_dir = log_dir
-        os.makedirs(self.log_dir, exist_ok=True)
-        self.current_file = None
-        self.writer = None
-        self.map_size = map_size
-        self.reset_episode_counters()
-
-    def reset_episode_counters(self):
-        self.heatmap_a = np.zeros(self.map_size, dtype=int)
-        self.heatmap_b = np.zeros(self.map_size, dtype=int)
-        self.stag_count = 0
-        self.plant_count = 0
-        self.mauling_count = 0
-        self.event_snapshots = []
-
-    def start_episode(self, episode_number):
-        self.reset_episode_counters()
-        path = os.path.join(self.log_dir, f"episode_{episode_number}.csv")
-        self.current_file = open(path, mode='w', newline='', encoding='utf-8')
-        self.writer = csv.writer(self.current_file)
-        self.writer.writerow([
-            "Step", "Mossa_A", "Mossa_B", 
-            "Pos_A", "Pos_B", "Pos_Stag", "Pos_Plant", 
-            "Probs_A", "Probs_B", "Reward_Step", "Evento"
-        ])
-
-    def log_step(self, step_idx, actions, positions, probs_a, probs_b, reward):
-        if not self.writer: return
-
-        pos_a, pos_b = positions.get('A'), positions.get('B')
-        
-        if pos_a != "N/D" and isinstance(pos_a, (list, tuple, np.ndarray)) and len(pos_a) == 2:
-            x, y = min(int(pos_a[0]), self.map_size[0]-1), min(int(pos_a[1]), self.map_size[1]-1)
-            self.heatmap_a[x, y] += 1
-            
-        if pos_b != "N/D" and isinstance(pos_b, (list, tuple, np.ndarray)) and len(pos_b) == 2:
-            x, y = min(int(pos_b[0]), self.map_size[0]-1), min(int(pos_b[1]), self.map_size[1]-1)
-            self.heatmap_b[x, y] += 1
-
-        evento_str = ""
-        if reward == 10.0: 
-            self.stag_count += 1
-            evento_str = "CERVO CATTURATO"
-            self.event_snapshots.append(f"Stag at Step {step_idx} | Pos A:{pos_a}, Pos B:{pos_b}, Stag:{positions.get('Stag')}")
-        elif 1.0 <= reward <= 2.0:
-            self.plant_count += 1
-            evento_str = "PIANTA"
-        elif reward < 0.0:
-            self.mauling_count += 1
-            evento_str = "MAULING (Cornata)"
-            self.event_snapshots.append(f"Mauling at Step {step_idx} | Pos A:{pos_a}, Pos B:{pos_b}, Stag:{positions.get('Stag')}")
-
-        self.writer.writerow([
-            step_idx, actions[0], actions[1], pos_a, pos_b, 
-            positions.get('Stag', 'N/D'), positions.get('Plant', 'N/D'), 
-            probs_a, probs_b, reward, evento_str
-        ])
-
-    def close_episode(self):
-        if self.current_file:
-            self.writer.writerow([])
-            self.writer.writerow(["--- RIASSUNTO COMPORTAMENTALE ---"])
-            self.writer.writerow(["Total Stags Caught:", self.stag_count])
-            self.writer.writerow(["Total Plants Eaten:", self.plant_count])
-            self.writer.writerow(["Total Maulings Sustained:", self.mauling_count])
-            self.writer.writerow([])
-            self.writer.writerow(["--- SNAPSHOT EVENTI CRITICI ---"])
-            for snapshot in self.event_snapshots: self.writer.writerow([snapshot])
-            self.writer.writerow([])
-            self.writer.writerow(["--- HEATMAP ESPLORAZIONE AGENTE A ---"])
-            for row in self.heatmap_a: self.writer.writerow(row.tolist())
-            self.writer.writerow([])
-            self.writer.writerow(["--- HEATMAP ESPLORAZIONE AGENTE B ---"])
-            for row in self.heatmap_b: self.writer.writerow(row.tolist())
-
-            self.current_file.close()
-            self.current_file = None
+def _annealed_learning_rate(config, iteration):
+    progress = min(iteration / max(config.num_iterations - 1, 1), 1.0)
+    return config.learning_rate + progress * (config.learning_rate_end - config.learning_rate)
 
 
-class EntropyScheduler:
-    def __init__(self, agent, start_value=0.15, end_value=0.001, decay_steps=10000):
-        self.agent = agent
-        self.start_value = start_value
-        self.end_value = end_value
-        self.decay_steps = decay_steps
-
-    def step(self, current_step):
-        if current_step >= self.decay_steps:
-            new_entropy = self.end_value
-        else:
-            completion_fraction = current_step / self.decay_steps
-            new_entropy = self.start_value - completion_fraction * (self.start_value - self.end_value)
-            
-        self.agent.entropy_coef.assign(new_entropy)
-        return new_entropy
+def _build_experiment_id(config: TrainingConfig, requested_name=None):
+    config_payload = json.dumps(
+        {key: value for key, value in vars(config).items() if key != 'seed'},
+        sort_keys=True,
+        separators=(',', ':')
+    )
+    config_hash = hashlib.sha1(config_payload.encode('utf-8')).hexdigest()[:8]
+    if requested_name:
+        return f"{requested_name}_{config_hash}"
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    return f"experiment_{timestamp}_{config_hash}"
 
 
-def _generate_annotated_heatmap_tf(heatmap_counts):
-    total = np.sum(heatmap_counts)
-    percentage_grid = (heatmap_counts / total) * 100 if total > 0 else heatmap_counts
-    
-    fig, ax = plt.subplots(figsize=(4, 4), dpi=100)
-    ax.imshow(percentage_grid, cmap='Blues', vmin=0, vmax=100)
-    
-    for row in range(percentage_grid.shape[0]):
-        for column in range(percentage_grid.shape[1]):
-            value = percentage_grid[row, column]
-            text_color = "white" if value > 45.0 else "black"
-            ax.text(column, row, f"{value:.1f}%", va='center', ha='center', color=text_color, fontsize=9, weight='bold')
-    
-    ax.set_xticks(range(5))
-    ax.set_yticks(range(5))
-    ax.set_xticklabels(range(5))
-    ax.set_yticklabels(range(5))
-    plt.tight_layout()
-    
-    buf = io.BytesIO()
-    plt.savefig(buf, format='png', bbox_inches='tight')
-    plt.close(fig)
-    buf.seek(0)
-    
-    image_tensor = tf.image.decode_png(buf.getvalue(), channels=4)
-    return tf.expand_dims(image_tensor, 0)
-
-
-# ==========================================
-# 3. ISOLATED TRAINING LOGIC (SRP)
-# ==========================================
-def _collect_rollout(agent, tf_env, memory, time_step, config: TrainingConfig):
-    """Handles environment interaction and data collection exclusively (Phase A)."""
-    fast_heatmap_a = np.zeros((config.map_size, config.map_size), dtype=int)
-    fast_heatmap_b = np.zeros((config.map_size, config.map_size), dtype=int)
-    stats = {'stags': 0, 'plants': 0, 'mauling': 0}
-
-    for _ in range(config.rollout_steps):
-        action_distribution, _ = agent.actor(time_step.observation)
-        raw_action = action_distribution.sample()
-        action_tensor = tf.cast(raw_action, tf.int32)
-        action_step = PolicyStep(action=action_tensor)
-        
-        next_time_step = tf_env.step(action_step.action)
-        traj = trajectory.from_transition(time_step, action_step, next_time_step)
-        memory.replay_buffer.add_batch(traj)
-        
-        # Fast heatmap update
-        flat_map = next_time_step.observation.numpy()[0]
-        xa, ya = min(int(flat_map[0]), config.map_size - 1), min(int(flat_map[1]), config.map_size - 1)
-        xb, yb = min(int(flat_map[2]), config.map_size - 1), min(int(flat_map[3]), config.map_size - 1)
-        
-        fast_heatmap_a[xa, ya] += 1
-        fast_heatmap_b[xb, yb] += 1
-
-        # Counter update
-        previous_reward = float(tf.reduce_sum(time_step.reward))
-        if previous_reward >= 10.0: stats['stags'] += 1
-        elif 1.0 <= previous_reward <= 2.0: stats['plants'] += 1
-        elif previous_reward < 0.0: stats['mauling'] += 1
-
-        time_step = next_time_step
-
-    return time_step, fast_heatmap_a, fast_heatmap_b, stats
-
-
-def _train_ppo_epochs(agent, trajectories, current_global_step, config: TrainingConfig):
-    """Handles tensor preparation and backpropagation exclusively (Phases B/C)."""
-    states = trajectories.observation
-    actions = trajectories.action
-    rewards = trajectories.reward
-    next_step_types = trajectories.next_step_type
-    
-    s_t = states[:, :-1, :]       
-    s_t_next = states[:, 1:, :]   
-    a_t = actions[:, :-1]         
-    r_t = rewards[:, :-1]         
-    
-    next_step_t = next_step_types[:, 1:] 
-    dones = tf.where(next_step_t == 2, tf.ones_like(r_t), tf.zeros_like(r_t))
-    dones = tf.cast(dones, tf.float32)
-
-    old_distribution, _ = agent.actor(s_t)
-    old_log_probs = old_distribution.log_prob(tf.cast(a_t, tf.int32))
-
-    train_loss = 0.0
-    for _ in range(config.ppo_epochs):
-        train_loss = agent.train_step(
-            states=s_t, actions=a_t, old_log_probs=old_log_probs, 
-            rewards=r_t, next_states=s_t_next, dones=dones,
-            global_step=tf.cast(current_global_step, tf.int64)
+def _create_experiment_paths(config: TrainingConfig, experiment_name=None, root_dir=None):
+    experiment_id = _build_experiment_id(config, experiment_name)
+    experiment_dir = Path(root_dir) if root_dir is not None else Path('./experiments') / experiment_id
+    if experiment_dir.exists():
+        raise FileExistsError(
+            f"Experiment directory already exists: {experiment_dir}. "
+            "Choose a different --experiment-name."
         )
-        
-    custom_return = tf.reduce_mean(tf.reduce_sum(r_t, axis=1))
-    return train_loss, custom_return
+
+    paths = {
+        'experiment_id': experiment_id,
+        'root': experiment_dir,
+        'checkpoints': experiment_dir / 'checkpoints',
+        'training_logs': experiment_dir / 'training_logs',
+    }
+    for key, path in paths.items():
+        if key != 'experiment_id':
+            path.mkdir(parents=True, exist_ok=True)
+
+    metadata = {
+        'experiment_id': experiment_id,
+        'created_at': datetime.now().isoformat(timespec='seconds'),
+        'hyperparameters': vars(config),
+    }
+    (experiment_dir / 'metadata.json').write_text(
+        json.dumps(metadata, indent=2), encoding='utf-8'
+    )
+    (experiment_dir / 'README.md').write_text(
+        f"# Experiment `{experiment_id}`\n\n"
+        "This directory contains the complete outputs for one isolated training run.\n\n"
+        "- Hyperparameters: `metadata.json`\n"
+        "- Checkpoints: `checkpoints/`\n"
+        "- TensorBoard logs: `training_logs/`\n"
+        "- Evaluation results: `evaluation_results.json`\n",
+        encoding='utf-8'
+    )
+    return paths
 
 
-# ==========================================
-# 4. ORCHESTRATORE PRINCIPALE
-# ==========================================
-def train_agent():
-    config = TrainingConfig()
+def train_agent(experiment_name=None, config=None, output_dir=None):
+    config = config or TrainingConfig()
+    tf.keras.utils.set_random_seed(config.seed)
+    experiment_paths = _create_experiment_paths(config, experiment_name, root_dir=output_dir)
+    print(f"Experiment outputs will be saved to: {experiment_paths['root']}")
+    print(f"Random seed: {config.seed}")
     
     print("1. Initializing Environment...")
-    logger_csv = BlackBoxLogger(map_size=(config.map_size, config.map_size))
-    py_env = TFStagHuntWrapper(run_away_after_maul=True)
+    py_env = TFStagHuntWrapper(seed=config.seed, run_away_after_maul=True)
     tf_env = tf_py_environment.TFPyEnvironment(py_env)
 
     print("2. Building Neural Networks...")
@@ -291,11 +147,11 @@ def train_agent():
         decay_steps=config.entropy_decay_steps 
     )
 
-    train_summary_writer = tf.summary.create_file_writer('./logs/train')
-    memory = MemoryManager(tf_env, agent)
+    train_summary_writer = tf.summary.create_file_writer(str(experiment_paths['training_logs']))
+    memory = MemoryManager(tf_env, agent, max_length=config.rollout_steps + 1)
     
     train_checkpointer = common.Checkpointer(
-        ckpt_dir='./checkpoints', max_to_keep=3, actor_network=agent.actor,       
+        ckpt_dir=str(experiment_paths['checkpoints']), max_to_keep=3, actor_network=agent.actor,
         critic_network=agent.critic, optimizer=agent.optimizer,       
         global_step=train_step_counter, heatmap_globale_a=heatmap_globale_a, heatmap_globale_b=heatmap_globale_b
     )
@@ -307,10 +163,13 @@ def train_agent():
 
     hard_mode_activated = False
     time_step = tf_env.reset()
+    training_metrics = []
     
     for i in range(config.num_iterations):
         current_global_step = train_step_counter.numpy()
         print(f"\n--- Iteration {i+1} (Global Step: {current_global_step}) ---")
+        current_learning_rate = _annealed_learning_rate(config, i)
+        agent.set_learning_rate(current_learning_rate)
         
         # --- Hyperparameter and curriculum update ---
         current_entropy = entropy_scheduler.step(current_global_step)
@@ -322,30 +181,52 @@ def train_agent():
 
         # --- A. Data collection ---
         print("A) Data collection (multiple rollout: 4 consecutive episodes)...")
-        time_step, fast_heatmap_a, fast_heatmap_b, stats = _collect_rollout(agent, tf_env, memory, time_step, config)
+        time_step, fast_heatmap_a, fast_heatmap_b, stats = collect_rollout(agent, tf_env, memory, time_step, config)
 
         # --- B/C. PPO training ---
-        print("B/C) Estrazione traiettoria e Custom PPO training in progress...")
+        print("B/C) Trajectory extraction and Custom PPO training in progress...")
         trajectories = memory.get_sequential_data()
         heatmap_globale_a.assign_add(fast_heatmap_a)
         heatmap_globale_b.assign_add(fast_heatmap_b)
         
-        train_loss, custom_return = _train_ppo_epochs(agent, trajectories, current_global_step, config)
+        train_loss, custom_return, agent_returns, diagnostics = train_ppo_epochs(
+            agent, trajectories, current_global_step, config
+        )
         memory.clear_buffer()
+        training_metrics.append({
+            'return': float(custom_return.numpy()),
+            'agent_a_return': float(agent_returns[0].numpy()),
+            'agent_b_return': float(agent_returns[1].numpy()),
+            'loss': float(train_loss.numpy() if hasattr(train_loss, 'numpy') else train_loss),
+            'entropy': float(current_entropy),
+            'stags_caught': float(stats['stags']),
+            'plants_eaten': float(stats['plants']),
+            'maulings_sustained': float(stats['mauling']),
+            'learning_rate': float(diagnostics['learning_rate'].numpy()),
+            'approx_kl': float(diagnostics['approx_kl'].numpy()),
+            'clip_fraction': float(diagnostics['clip_fraction'].numpy()),
+            'policy_loss': float(diagnostics['policy_loss'].numpy()),
+            'value_loss': float(diagnostics['value_loss'].numpy()),
+            'policy_entropy': float(diagnostics['entropy'].numpy()),
+            'gradient_norm': float(diagnostics['gradient_norm'].numpy()),
+        })
 
         # --- D. Logging and saving ---
         with train_summary_writer.as_default():
             tf.summary.scalar('Loss/Total_Loss', train_loss, step=current_global_step)
             tf.summary.scalar('Loss/Entropy_Coefficient', current_entropy, step=current_global_step)
             tf.summary.scalar('Metrics/Custom_Average_Return', custom_return, step=current_global_step)
+            tf.summary.scalar('Metrics/Agent_A_Return', agent_returns[0], step=current_global_step)
+            tf.summary.scalar('Metrics/Agent_B_Return', agent_returns[1], step=current_global_step)
+            tf.summary.scalar('Training/Learning_Rate', current_learning_rate, step=current_global_step)
             tf.summary.scalar('Behavior/Stags_Caught', stats['stags'], step=current_global_step)
             tf.summary.scalar('Behavior/Plants_Eaten', stats['plants'], step=current_global_step)
             tf.summary.scalar('Behavior/Maulings_Sustained', stats['mauling'], step=current_global_step)
             
             if current_global_step % config.log_interval == 0:
                 print(f"Step {current_global_step} | Current entropy: {current_entropy:.4f}")
-                tf.summary.image('Exploration/Heatmap_Agent_A', _generate_annotated_heatmap_tf(heatmap_globale_a.numpy()), step=current_global_step)
-                tf.summary.image('Exploration/Heatmap_Agent_B', _generate_annotated_heatmap_tf(heatmap_globale_b.numpy()), step=current_global_step)
+                tf.summary.image('Exploration/Heatmap_Agent_A', generate_annotated_heatmap(heatmap_globale_a.numpy()), step=current_global_step)
+                tf.summary.image('Exploration/Heatmap_Agent_B', generate_annotated_heatmap(heatmap_globale_b.numpy()), step=current_global_step)
         
         train_step_counter.assign_add(1)
         step = train_step_counter.numpy()
@@ -355,8 +236,236 @@ def train_agent():
             train_checkpointer.save(global_step=step)
             gc.collect()
 
+    total_stags = sum(iteration['stags_caught'] for iteration in training_metrics)
+    total_plants = sum(iteration['plants_eaten'] for iteration in training_metrics)
+    total_maulings = sum(iteration['maulings_sustained'] for iteration in training_metrics)
+    convergence_iteration_a = _find_convergence_iteration(
+        training_metrics, config, reward_key='agent_a_return'
+    )
+    convergence_iteration_b = _find_convergence_iteration(
+        training_metrics, config, reward_key='agent_b_return'
+    )
+    convergence_iteration = (
+        max(convergence_iteration_a, convergence_iteration_b)
+        if convergence_iteration_a is not None and convergence_iteration_b is not None
+        else None
+    )
+    (experiment_paths['root'] / 'training_results.json').write_text(
+        json.dumps({
+            'experiment_id': experiment_paths['experiment_id'],
+            'seed': config.seed,
+            'iterations': len(training_metrics),
+            'total_stags_caught': total_stags,
+            'total_plants_eaten': total_plants,
+            'total_maulings_sustained': total_maulings,
+            'convergence_iteration': convergence_iteration,
+            'convergence_iteration_agent_a': convergence_iteration_a,
+            'convergence_iteration_agent_b': convergence_iteration_b,
+            'convergence_definition': {
+                'reward_rate_threshold': config.convergence_reward_rate,
+                'stable_window': config.convergence_window,
+                'max_reward_rate_std': config.convergence_max_rate_std,
+            },
+            'heatmap_agent_a': heatmap_globale_a.numpy().tolist(),
+            'heatmap_agent_b': heatmap_globale_b.numpy().tolist(),
+        }, indent=2),
+        encoding='utf-8'
+    )
+
     print("Training Completed successfully!")
+    return training_metrics
 
 
 if __name__ == "__main__":
-    train_agent()
+    parser = argparse.ArgumentParser(description='Train a PPO agent in an isolated experiment directory.')
+    parser.add_argument(
+        '--experiment-name',
+        required=True,
+        help='Readable experiment prefix. Hyperparameter hash and timestamp are added automatically.'
+    )
+    seed_group = parser.add_mutually_exclusive_group()
+    seed_group.add_argument('--seed', type=int, help='Seed for one training run.')
+    seed_group.add_argument(
+        '--seeds',
+        help='Comma-separated seeds for independent sequential training runs.'
+    )
+    parser.add_argument('--num-iterations', type=int)
+    parser.add_argument('--rollout-steps', type=int)
+    parser.add_argument('--minibatch-size', type=int)
+    parser.add_argument('--ppo-epochs', type=int)
+    parser.add_argument('--curriculum-threshold', type=int)
+    parser.add_argument('--log-interval', type=int)
+    parser.add_argument('--save-interval', type=int)
+    parser.add_argument('--map-size', type=int)
+    parser.add_argument('--learning-rate', type=float)
+    parser.add_argument('--learning-rate-end', type=float)
+    parser.add_argument('--clip-epsilon', type=float)
+    parser.add_argument('--entropy-start', type=float)
+    parser.add_argument('--entropy-end', type=float)
+    parser.add_argument('--entropy-decay-steps', type=int)
+    parser.add_argument('--convergence-reward-rate', type=float)
+    parser.add_argument('--convergence-window', type=int)
+    parser.add_argument('--convergence-max-rate-std', type=float)
+    args = parser.parse_args()
+    config_overrides = {
+        field.name: getattr(args, field.name)
+        for field in TrainingConfig.__dataclass_fields__.values()
+        if getattr(args, field.name) is not None
+    }
+    base_config = replace(TrainingConfig(), **config_overrides)
+
+    if args.seeds is None:
+        seeds = [base_config.seed]
+    else:
+        try:
+            seeds = [int(seed.strip()) for seed in args.seeds.split(',') if seed.strip()]
+        except ValueError as error:
+            parser.error(f'--seeds must be a comma-separated list of integers: {error}')
+        if not seeds:
+            parser.error('--seeds must contain at least one integer.')
+        if len(seeds) != len(set(seeds)):
+            parser.error('--seeds must not contain duplicate values.')
+
+    if len(seeds) == 1:
+        train_agent(
+            experiment_name=args.experiment_name,
+            config=replace(base_config, seed=seeds[0])
+        )
+    else:
+        group_id = _build_experiment_id(base_config, args.experiment_name)
+        group_dir = Path('./experiments') / group_id
+        if group_dir.exists():
+            raise FileExistsError(
+                f'Experiment directory already exists: {group_dir}. '
+                'Choose a different --experiment-name.'
+            )
+
+        group_dir.mkdir(parents=True)
+        (group_dir / 'metadata.json').write_text(json.dumps({
+            'experiment_id': group_id,
+            'created_at': datetime.now().isoformat(timespec='seconds'),
+            'type': 'multi_seed_training_group',
+            'seeds': seeds,
+            'hyperparameters': vars(base_config),
+        }, indent=2), encoding='utf-8')
+        (group_dir / 'README.md').write_text(
+            f'# Training group `{group_id}`\n\n'
+            f'This experiment aggregates independent training runs for seeds: {seeds}.\n\n'
+            '- Per-seed artifacts: `runs/seed_<seed>/`\n'
+            '- Aggregate results: `training_results.json`\n'
+            '- Group metadata: `metadata.json`\n',
+            encoding='utf-8'
+        )
+
+        training_runs = []
+        run_totals = []
+        convergence_iterations = []
+        convergence_iterations_a = []
+        convergence_iterations_b = []
+        heatmap_sum_a = None
+        heatmap_sum_b = None
+        for seed in seeds:
+            run_config = replace(base_config, seed=seed)
+            run_dir = group_dir / 'runs' / f'seed_{seed}'
+            print(f'=== Starting training run with seed {seed} ===')
+            metrics = train_agent(
+                experiment_name=f'{group_id}_seed_{seed}',
+                config=run_config,
+                output_dir=run_dir
+            )
+            training_runs.append(metrics)
+
+            run_results = json.loads((run_dir / 'training_results.json').read_text(encoding='utf-8'))
+            run_totals.append(run_results)
+            if run_results['convergence_iteration'] is not None:
+                convergence_iterations.append(run_results['convergence_iteration'])
+            if run_results['convergence_iteration_agent_a'] is not None:
+                convergence_iterations_a.append(run_results['convergence_iteration_agent_a'])
+            if run_results['convergence_iteration_agent_b'] is not None:
+                convergence_iterations_b.append(run_results['convergence_iteration_agent_b'])
+            run_heatmap_a = np.asarray(run_results['heatmap_agent_a'], dtype=int)
+            run_heatmap_b = np.asarray(run_results['heatmap_agent_b'], dtype=int)
+            heatmap_sum_a = run_heatmap_a if heatmap_sum_a is None else heatmap_sum_a + run_heatmap_a
+            heatmap_sum_b = run_heatmap_b if heatmap_sum_b is None else heatmap_sum_b + run_heatmap_b
+
+            tf.keras.backend.clear_session()
+            gc.collect()
+
+        metric_names = [
+            'return', 'agent_a_return', 'agent_b_return', 'loss', 'entropy', 'stags_caught',
+            'plants_eaten', 'maulings_sustained', 'learning_rate', 'approx_kl',
+            'clip_fraction', 'policy_loss', 'value_loss', 'policy_entropy', 'gradient_norm'
+        ]
+        metric_curves = {
+            metric: np.asarray([
+                [iteration[metric] for iteration in run]
+                for run in training_runs
+            ], dtype=float)
+            for metric in metric_names
+        }
+        final_metrics = {
+            metric: np.asarray([
+                run[-1][metric] if run else float('nan')
+                for run in training_runs
+            ], dtype=float)
+            for metric in metric_names
+        }
+        aggregate_metrics = {}
+        for metric in metric_names:
+            curve = metric_curves[metric]
+            final_values = final_metrics[metric]
+            aggregate_metrics[metric] = {
+                'final_mean': float(np.nanmean(final_values)),
+                'final_std': float(np.nanstd(final_values, ddof=1)) if len(final_values) > 1 else 0.0,
+                'mean_by_iteration': np.nanmean(curve, axis=0).tolist(),
+                'std_by_iteration': (
+                    np.nanstd(curve, axis=0, ddof=1) if len(training_runs) > 1
+                    else np.zeros(curve.shape[1])
+                ).tolist(),
+                'final_by_seed': {
+                    str(seed): float(value)
+                    for seed, value in zip(seeds, final_values)
+                },
+            }
+
+        aggregate_results = {
+            'experiment_id': group_id,
+            'seeds': seeds,
+            'iterations': len(training_runs[0]) if training_runs else 0,
+            'metrics': aggregate_metrics,
+            'total_stags_caught': sum(run['total_stags_caught'] for run in run_totals),
+            'total_plants_eaten': sum(run['total_plants_eaten'] for run in run_totals),
+            'total_maulings_sustained': sum(run['total_maulings_sustained'] for run in run_totals),
+            'convergence_iteration_mean': (
+                float(np.mean(convergence_iterations)) if convergence_iterations else None
+            ),
+            'convergence_iteration_std': (
+                float(np.std(convergence_iterations, ddof=1))
+                if len(convergence_iterations) > 1 else 0.0
+            ),
+            'converged_seeds': len(convergence_iterations),
+            'convergence_iteration_agent_a_mean': (
+                float(np.mean(convergence_iterations_a)) if convergence_iterations_a else None
+            ),
+            'convergence_iteration_agent_b_mean': (
+                float(np.mean(convergence_iterations_b)) if convergence_iterations_b else None
+            ),
+            'converged_seeds_agent_a': len(convergence_iterations_a),
+            'converged_seeds_agent_b': len(convergence_iterations_b),
+            'convergence_definition': {
+                'reward_rate_threshold': base_config.convergence_reward_rate,
+                'stable_window': base_config.convergence_window,
+                'max_reward_rate_std': base_config.convergence_max_rate_std,
+            },
+            'heatmap_agent_a': heatmap_sum_a.tolist() if heatmap_sum_a is not None else [],
+            'heatmap_agent_b': heatmap_sum_b.tolist() if heatmap_sum_b is not None else [],
+        }
+        (group_dir / 'training_results.json').write_text(
+            json.dumps(aggregate_results, indent=2), encoding='utf-8'
+        )
+        print('Aggregate final metrics:')
+        for metric, values in aggregate_metrics.items():
+            print(
+                f'  {metric}: mean={values["final_mean"]:.4f}, '
+                f'std={values["final_std"]:.4f}'
+            )

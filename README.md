@@ -7,10 +7,98 @@ DISCLAIMER: This repository is a fork of the original Gym-Stag-Hunt to update it
 The custom trainer is located at `Autonomus_Project/training/train.py` and can be started from the `Autonomus_Project` directory with:
 
 ```bash
-python -m training.train
+python -m training.train --experiment-name baseline
 ```
 
-The previous trainer remains recoverable from the Git history. Training checkpoints, logs, virtual environments, backups, and local planning files are excluded by `.gitignore`.
+To repeat the same configuration with multiple independent training seeds:
+
+```bash
+python -m training.train --experiment-name baseline --seeds 42,123,456,789,1001
+```
+
+Each rollout is stored in full before learning. The default 260-step rollout
+is divided into temporal minibatches of 65 steps for both agents, shuffled and
+processed for 4 PPO epochs. This produces 4 minibatch updates per epoch while
+keeping GAE and return targets fixed for the whole rollout. The minibatch size
+can be changed with `--minibatch-size`.
+
+This launches one run per seed in sequence. The runs are stored below one
+experiment group, and `training_results.json` reports mean and standard
+deviation across seeds for return, PPO loss, entropy coefficient, stag catches,
+plants eaten, and maulings, plus the summed behavior totals and position
+heatmaps across all seeds. Per-seed checkpoints and logs remain available
+under `runs/seed_<seed>/`, and each per-seed run has its own
+`training_results.json` with that run's totals and heatmaps.
+
+Before every new run, choose a meaningful experiment name. The command requires this name so the run cannot start anonymously:
+
+```text
+baseline_lr_3e4_entropy_015
+hard_curriculum_lr_1e4
+```
+
+Every training run creates a unique directory under `Autonomus_Project/experiments/`, even when the hyperparameters are changed. The directory contains:
+
+```text
+experiments/<experiment_id>/
+  metadata.json
+  checkpoints/
+  training_logs/
+  training_results.json
+```
+
+`training_results.json` records the total stags caught, plants eaten, and
+maulings sustained over the whole run, plus the accumulated position heatmaps
+for both agents. It also records `convergence_iteration`: the first iteration
+whose last five rollout returns per step are all at least 0.4 and have
+standard deviation at most 0.04. The criterion is computed independently for
+Agent A and Agent B; the overall convergence iteration is available only when
+both agents have converged. This avoids treating a single high-reward spike as
+convergence and does not depend on the rollout length. The criteria can be
+changed from the CLI, for example:
+
+```bash
+python -m training.train --experiment-name baseline \
+  --convergence-reward-rate 0.4 \
+  --convergence-window 5 \
+  --convergence-max-rate-std 0.04
+```
+
+Inspect the training heatmap and results with:
+
+```bash
+python -m evaluate.analyze_heatmap --experiment <experiment_id> --source training
+```
+
+`metadata.json` records the complete `TrainingConfig`, while the experiment ID contains a hash of those hyperparameters. A second run never reuses an existing experiment directory.
+
+Each experiment also contains its own README with the output layout. Always keep the experiment ID printed at startup; use that same ID for evaluation and comparison.
+
+The residual pre-isolation checkpoint was migrated to `experiments/legacy_ckpt16000_e1146e0a/`. Its metadata identifies which values were verified directly from the TensorFlow checkpoint and which were reconstructed from the historical training code.
+
+Evaluation tools are located in `Autonomus_Project/evaluate/`:
+
+```bash
+python -m evaluate.evaluate --experiment <experiment_id> --episodes 5
+python -m evaluate.analyze_heatmap --experiment <experiment_id> --source evaluation
+```
+
+Evaluation uses ten fixed seeds and ten episodes per seed by default, then reports
+the mean and standard deviation of the reward. You can run a shorter comparison
+with custom seeds, for example:
+
+```bash
+python -m evaluate.evaluate --experiment <experiment_id> --seeds 101,202,303 --episodes-per-seed 5
+```
+
+Evaluation restores the latest checkpoint from the selected experiment and writes `evaluation_results.json` into that same directory. To list available experiments from PowerShell:
+
+```powershell
+Get-ChildItem .\experiments -Directory
+Get-Content .\experiments\<experiment_id>\metadata.json
+```
+
+The previous trainer remains recoverable from the Git history. Training outputs are stored inside `Autonomus_Project` in `checkpoints` and `training_logs`; these files, virtual environments, backups, and local planning files are excluded by `.gitignore`.
 
 What follows is the original Readme, preserved so you can get the full context of the original repo and research behind it. Some of the reported arguments have been renamed (e.g., episodes_per_game has become max_timesteps) and others have changed a little bit, so I suggest you to check the actual code in case of doubts.
 

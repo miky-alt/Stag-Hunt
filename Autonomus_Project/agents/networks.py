@@ -1,10 +1,20 @@
 import os
 os.environ["TF_USE_LEGACY_KERAS"] = "1"
 
+import math
 import tensorflow as tf
 from tf_agents.networks import network
 from tf_agents.utils import nest_utils
 import tensorflow_probability as tfp
+
+
+def _orthogonal_layer(size, gain):
+    return tf.keras.layers.Dense(
+        size,
+        activation='tanh',
+        kernel_initializer=tf.keras.initializers.Orthogonal(gain=float(gain)),
+        bias_initializer=tf.keras.initializers.Zeros(),
+    )
 
 class ActorNetwork(network.Network):
     """
@@ -22,17 +32,15 @@ class ActorNetwork(network.Network):
         self._output_tensor_spec = output_tensor_spec
         
         # Build the hidden layers dynamically
-        self._hidden_layers = [
-            tf.keras.layers.Dense(size, activation='relu', kernel_initializer='he_normal')
-            for size in hidden_sizes
-        ]
+        self._hidden_layers = [_orthogonal_layer(size, math.sqrt(2.0)) for size in hidden_sizes]
             
         # The output layer matches the number of possible actions
         num_actions = output_tensor_spec.maximum - output_tensor_spec.minimum + 1
         self._action_logits = tf.keras.layers.Dense(
             num_actions,
-            activation=None, # Logits should be linear
-            kernel_initializer='glorot_uniform'
+            activation=None,
+            kernel_initializer=tf.keras.initializers.Orthogonal(gain=0.01),
+            bias_initializer=tf.keras.initializers.Zeros(),
         )
 
     def call(self, inputs, step_type=None, network_state=(), training=False):
@@ -69,16 +77,14 @@ class CriticNetwork(network.Network):
             name='CriticNetwork'
         )
         
-        self._hidden_layers = [
-            tf.keras.layers.Dense(size, activation='relu', kernel_initializer='he_normal')
-            for size in hidden_sizes
-        ]
+        self._hidden_layers = [_orthogonal_layer(size, math.sqrt(2.0)) for size in hidden_sizes]
             
         # Output layer is a single linear node
         self._value_output = tf.keras.layers.Dense(
             1, 
             activation=None,
-            kernel_initializer='glorot_uniform'
+            kernel_initializer=tf.keras.initializers.Orthogonal(gain=1.0),
+            bias_initializer=tf.keras.initializers.Zeros(),
         )
 
     def call(self, inputs, step_type=None, network_state=(), training=False):
