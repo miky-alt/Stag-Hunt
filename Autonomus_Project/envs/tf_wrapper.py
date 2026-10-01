@@ -17,6 +17,7 @@ class TFStagHuntWrapper(py_environment.PyEnvironment):
     """
     def __init__(self, env_name='StagHunt-Hunt-v0', **kwargs):
         super().__init__()
+        self.env_name = env_name
         
         configs = {
             'obs_type': 'coords',
@@ -29,10 +30,10 @@ class TFStagHuntWrapper(py_environment.PyEnvironment):
 
         self.env = gym.make(env_name, **configs)
         
-        # The array expands from 10 to 31 entries for the complete vector mapping.
-        # 10 (base) + 6 (stag) + 3 (partner) + 6 (plant 1) + 6 (plant 2) = 31
+        raw_feature_size = self.env.observation_space.shape[-1]
+        self._feature_size = 31 if env_name == 'StagHunt-Hunt-v0' else raw_feature_size
         self._observation_spec = array_spec.ArraySpec(
-            shape=(31,),
+            shape=(self._feature_size,),
             dtype=np.float32,
             name='observation'
         )
@@ -123,6 +124,11 @@ class TFStagHuntWrapper(py_environment.PyEnvironment):
 
         # Concatenate the original 10 features with the 21 radar features.
         return np.concatenate([flat_observation, radar_features], axis=0)
+
+    def _transform_observation(self, observation):
+        if self.env_name == 'StagHunt-Hunt-v0':
+            return self._inject_geometric_radar(observation)
+        return np.asarray(observation, dtype=np.float32)
     
     def _reset(self):
         if self._initial_seed is not None:
@@ -134,8 +140,8 @@ class TFStagHuntWrapper(py_environment.PyEnvironment):
             obs, info = self.env.reset()
         #time.sleep(1) 
         
-        obs_A_enhanced = self._inject_geometric_radar(obs[0])
-        obs_B_enhanced = self._inject_geometric_radar(obs[1])
+        obs_A_enhanced = self._transform_observation(obs[0])
+        obs_B_enhanced = self._transform_observation(obs[1])
         
         obs_stacked = np.array([obs_A_enhanced, obs_B_enhanced], dtype=np.float32)
         return ts.restart(obs_stacked, batch_size=2)
@@ -143,8 +149,8 @@ class TFStagHuntWrapper(py_environment.PyEnvironment):
     def _step(self, action):
         next_obs, rewards, term, trunc, info = self.env.step(action.tolist())
         
-        obs_A_enhanced = self._inject_geometric_radar(next_obs[0])
-        obs_B_enhanced = self._inject_geometric_radar(next_obs[1])
+        obs_A_enhanced = self._transform_observation(next_obs[0])
+        obs_B_enhanced = self._transform_observation(next_obs[1])
 
         obs_stacked = np.array([obs_A_enhanced, obs_B_enhanced], dtype=np.float32)
         rewards_stacked = np.array([float(rewards[0]), float(rewards[1])], dtype=np.float32)
@@ -166,9 +172,76 @@ class TFStagHuntWrapper(py_environment.PyEnvironment):
         )
     
     def set_stag_run_away_after_maul(self, value: bool):
+        if self.env_name != 'StagHunt-Hunt-v0':
+            return
         if hasattr(self.env, 'run_away_after_maul'):
             self.env.run_away_after_maul = value
             print("run_away_after_maul setted")
         elif hasattr(self.env.unwrapped, 'run_away_after_maul'):
             print("run_away_after_maul setted")
             self.env.unwrapped.run_away_after_maul = value
+
+
+class ParallelStagHuntEnv(TFStagHuntWrapper):
+    """One two-agent game suitable for a ParallelPyEnvironment worker."""
+
+    @property
+    def batched(self):
+        return False
+
+    def observation_spec(self):
+        return array_spec.ArraySpec(
+            shape=(2, self._feature_size), dtype=np.float32, name='observation'
+        )
+
+    def action_spec(self):
+        return array_spec.BoundedArraySpec(
+            shape=(2,), dtype=np.int32, minimum=0, maximum=4, name='action'
+        )
+
+    def reward_spec(self):
+        return array_spec.ArraySpec(shape=(2,), dtype=np.float32, name='reward')
+
+    def _reset(self):
+        if self._initial_seed is not None:
+            random.seed(self._initial_seed)
+            np.random.seed(self._initial_seed)
+            obs, _ = self.env.reset(seed=self._initial_seed)
+            self._initial_seed = None
+        else:
+            obs, _ = self.env.reset()
+
+        observations = np.array([
+            self._transform_observation(obs[0]),
+            self._transform_observation(obs[1]),
+        ], dtype=np.float32)
+        return ts.TimeStep(
+            step_type=np.int32(ts.StepType.FIRST),
+            reward=np.zeros(2, dtype=np.float32),
+            discount=np.float32(1.0),
+            observation=observations,
+        )
+
+    def _step(self, action):
+        next_obs, rewards, term, trunc, _ = self.env.step(
+            np.asarray(action, dtype=np.int32).tolist()
+        )
+        observations = np.array([
+            self._transform_observation(next_obs[0]),
+            self._transform_observation(next_obs[1]),
+        ], dtype=np.float32)
+        rewards = np.asarray(rewards, dtype=np.float32)
+
+        if term or trunc:
+            return ts.TimeStep(
+                step_type=np.int32(ts.StepType.LAST),
+                reward=rewards,
+                discount=np.float32(0.0),
+                observation=observations,
+            )
+        return ts.TimeStep(
+            step_type=np.int32(ts.StepType.MID),
+            reward=rewards,
+            discount=np.float32(1.0),
+            observation=observations,
+        )

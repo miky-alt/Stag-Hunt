@@ -1,5 +1,6 @@
 from tf_agents.replay_buffers import tf_uniform_replay_buffer
 from tf_agents.policies import actor_policy # Add the actor policy import.
+from tf_agents.trajectories import trajectory
 
 class MemoryManager:
     def __init__(self, tf_env, agent, max_length: int = 260):
@@ -9,16 +10,30 @@ class MemoryManager:
         self.tf_env = tf_env
         self.agent = agent
         
-        # 1. Create the exploration policy here so it becomes the system's core.
-        self.training_policy = actor_policy.ActorPolicy(
-            time_step_spec=self.tf_env.time_step_spec(),
-            action_spec=self.tf_env.action_spec(),
-            actor_network=self.agent.actor # The configured actor network.
-        )
+        # Parallel workers expose both agents as one vector action, which is
+        # not representable by TF-Agents' scalar ActorPolicy.
+        if len(self.tf_env.observation_spec().shape) == 2:
+            time_step_spec = self.tf_env.time_step_spec()
+            self.trajectory_spec = trajectory.Trajectory(
+                step_type=time_step_spec.step_type,
+                observation=time_step_spec.observation,
+                action=self.tf_env.action_spec(),
+                policy_info=(),
+                next_step_type=time_step_spec.step_type,
+                reward=time_step_spec.reward,
+                discount=time_step_spec.discount,
+            )
+        else:
+            self.training_policy = actor_policy.ActorPolicy(
+                time_step_spec=self.tf_env.time_step_spec(),
+                action_spec=self.tf_env.action_spec(),
+                actor_network=self.agent.actor
+            )
+            self.trajectory_spec = self.training_policy.trajectory_spec
 
         # 2. Initialize the rollout buffer from the policy specification.
         self.replay_buffer = tf_uniform_replay_buffer.TFUniformReplayBuffer(
-            data_spec=self.training_policy.trajectory_spec, # Critical specification.
+            data_spec=self.trajectory_spec,
             batch_size=self.tf_env.batch_size,
             max_length=max_length
         )

@@ -14,17 +14,27 @@ import tensorflow as tf
 from dataclasses import replace
 
 from tf_agents.environments import tf_py_environment
+from tf_agents.environments import parallel_py_environment
+from tf_agents.specs import tensor_spec
+from tf_agents.system import multiprocessing as tf_multiprocessing
 from tf_agents.utils import common
 
 # Import our custom modules
-from envs.tf_wrapper import TFStagHuntWrapper
+from envs.tf_wrapper import TFStagHuntWrapper, ParallelStagHuntEnv
 from agents.networks import ActorNetwork, CriticNetwork
-from agents.ppo_custom import CustomPPO
+from agents.ppo_custom import CustomPPO, MultiAgentPPO
 from training.config import TrainingConfig
 from training.memory import MemoryManager
 from training.rollouts import collect_rollout, train_ppo_epochs
 from training.scheduling import EntropyScheduler
 from training.visualization import generate_annotated_heatmap
+
+_PARALLEL_MP_INITIALIZED = False
+ENVIRONMENT_IDS = {
+    'hunt': 'StagHunt-Hunt-v0',
+    'harvest': 'StagHunt-Harvest-v0',
+    'escalation': 'StagHunt-Escalation-v0',
+}
 
 
 def _find_convergence_iteration(training_metrics, config, reward_key='return'):
@@ -105,6 +115,133 @@ def _create_experiment_paths(config: TrainingConfig, experiment_name=None, root_
     return paths
 
 
+def _create_training_environment(config, run_away_after_maul=True):
+    global _PARALLEL_MP_INITIALIZED
+    try:
+        env_name = ENVIRONMENT_IDS[config.environment]
+    except KeyError as error:
+        raise ValueError(
+            f"Unknown environment '{config.environment}'. "
+            f"Choose one of {sorted(ENVIRONMENT_IDS)}."
+        ) from error
+    environment_kwargs = {}
+    if config.environment == 'hunt':
+        environment_kwargs['run_away_after_maul'] = run_away_after_maul
+
+    if config.num_parallel_envs <= 1:
+        py_env = TFStagHuntWrapper(
+            env_name=env_name,
+            seed=config.seed,
+            **environment_kwargs,
+        )
+        return py_env, tf_py_environment.TFPyEnvironment(py_env), False
+
+    if not _PARALLEL_MP_INITIALIZED:
+        tf_multiprocessing.enable_interactive_mode()
+        _PARALLEL_MP_INITIALIZED = True
+    seeds = [config.seed + environment_index for environment_index in range(config.num_parallel_envs)]
+    env_constructors = [
+        lambda seed=seed: ParallelStagHuntEnv(
+            env_name=env_name,
+            seed=seed,
+            **environment_kwargs,
+        )
+        for seed in seeds
+    ]
+    py_env = parallel_py_environment.ParallelPyEnvironment(
+        env_constructors,
+        start_serially=True,
+        blocking=False,
+        flatten=True,
+    )
+    return py_env, tf_py_environment.TFPyEnvironment(py_env), True
+
+
+def _activate_curriculum(config, py_env, tf_env, memory, agent, is_parallel):
+    if config.environment != 'hunt':
+        return py_env, tf_env, memory, None
+    if is_parallel:
+        py_env.close()
+        py_env, tf_env, _ = _create_training_environment(
+            config,
+            run_away_after_maul=False,
+        )
+        memory = MemoryManager(
+            tf_env,
+            agent,
+            max_length=config.rollout_steps + 1,
+        )
+        return py_env, tf_env, memory, tf_env.reset()
+
+    py_env.set_stag_run_away_after_maul(False)
+    return py_env, tf_env, memory, None
+
+
+def _build_agent(config, observation_spec, action_spec):
+    def build_actor():
+        return ActorNetwork(observation_spec, action_spec, hidden_sizes=(128, 128))
+
+    if config.critic_observation not in {'local', 'joint'}:
+        raise ValueError("critic_observation must be 'local' or 'joint'.")
+
+    critic_spec = observation_spec
+    critic_output_size = 1
+    if config.critic_observation == 'joint':
+        critic_spec = tensor_spec.TensorSpec(
+            shape=(observation_spec.shape[-1] * 2,),
+            dtype=observation_spec.dtype,
+            name='joint_observation',
+        )
+        critic_output_size = 2
+
+    def build_critic():
+        return CriticNetwork(
+            critic_spec,
+            hidden_sizes=(128, 128),
+            output_size=critic_output_size,
+        )
+
+    architecture = config.agent_architecture
+    if architecture == 'shared_shared':
+        actors = [build_actor()]
+        critics = [build_critic()]
+    elif architecture == 'separate_actors_shared_critic':
+        actors = [build_actor(), build_actor()]
+        shared_critic = build_critic()
+        critics = [shared_critic, shared_critic]
+    elif architecture == 'separate_actors_separate_critics':
+        actors = [build_actor(), build_actor()]
+        critics = [build_critic(), build_critic()]
+    else:
+        raise ValueError(
+            f'Unknown agent architecture: {architecture}. '
+            'Use shared_shared, separate_actors_shared_critic, or '
+            'separate_actors_separate_critics.'
+        )
+
+    trainers = [
+        CustomPPO(
+            actor_net=actor,
+            critic_net=critic,
+            lr=config.learning_rate,
+            clip_epsilon=config.clip_epsilon,
+            value_loss_coef=config.value_loss_coef,
+            entropy_coef=config.entropy_start,
+            value_normalization=config.value_normalization,
+            value_clipping=config.value_clipping,
+            value_clip_epsilon=config.value_clip_epsilon,
+        )
+        for actor, critic in zip(actors, critics)
+    ]
+    if config.value_normalization and architecture in {
+        'shared_shared', 'separate_actors_shared_critic'
+    }:
+        shared_normalizer = trainers[0].value_normalizer
+        for trainer in trainers[1:]:
+            trainer.value_normalizer = shared_normalizer
+    return MultiAgentPPO(trainers, architecture)
+
+
 def train_agent(experiment_name=None, config=None, output_dir=None):
     config = config or TrainingConfig()
     tf.keras.utils.set_random_seed(config.seed)
@@ -113,32 +250,31 @@ def train_agent(experiment_name=None, config=None, output_dir=None):
     print(f"Random seed: {config.seed}")
     
     print("1. Initializing Environment...")
-    py_env = TFStagHuntWrapper(seed=config.seed, run_away_after_maul=True)
-    tf_env = tf_py_environment.TFPyEnvironment(py_env)
+    py_env, tf_env, is_parallel = _create_training_environment(config)
 
     print("2. Building Neural Networks...")
-    actor_net = ActorNetwork(
-        input_tensor_spec=tf_env.observation_spec(), 
-        output_tensor_spec=tf_env.action_spec(),
-        hidden_sizes=(128, 128)
-    )
-    value_net = CriticNetwork(
-        input_tensor_spec=tf_env.observation_spec(),
-        hidden_sizes=(128, 128)
+    if is_parallel:
+        network_observation_spec = tensor_spec.TensorSpec(
+            shape=(tf_env.observation_spec().shape[-1],),
+            dtype=tf.float32,
+            name='observation',
+        )
+        network_action_spec = tensor_spec.BoundedTensorSpec(
+            shape=(), dtype=tf.int32, minimum=0, maximum=4, name='action'
+        )
+    else:
+        network_observation_spec = tf_env.observation_spec()
+        network_action_spec = tf_env.action_spec()
+    agent = _build_agent(
+        config,
+        network_observation_spec,
+        network_action_spec,
     )
 
     print("3. Compiling the CUSTOM PPO Agent...")
     train_step_counter = tf.Variable(0, dtype=tf.int64, trainable=False, name="global_step")    
     heatmap_globale_a = tf.Variable(tf.zeros((config.map_size, config.map_size), dtype=tf.int32), trainable=False, name="heatmap_globale_a")
     heatmap_globale_b = tf.Variable(tf.zeros((config.map_size, config.map_size), dtype=tf.int32), trainable=False, name="heatmap_globale_b")
-
-    agent = CustomPPO(
-        actor_net=actor_net,
-        critic_net=value_net,
-        lr=config.learning_rate,
-        clip_epsilon=config.clip_epsilon,
-        entropy_coef=config.entropy_start
-    )
 
     entropy_scheduler = EntropyScheduler(
         agent=agent, 
@@ -150,10 +286,36 @@ def train_agent(experiment_name=None, config=None, output_dir=None):
     train_summary_writer = tf.summary.create_file_writer(str(experiment_paths['training_logs']))
     memory = MemoryManager(tf_env, agent, max_length=config.rollout_steps + 1)
     
+    checkpoint_items = {
+        'global_step': train_step_counter,
+        'heatmap_globale_a': heatmap_globale_a,
+        'heatmap_globale_b': heatmap_globale_b,
+    }
+    if agent.architecture == 'shared_shared':
+        checkpoint_items.update({
+            'actor_network': agent.actor,
+            'critic_network': agent.critic,
+            'optimizer': agent.optimizer,
+        })
+    else:
+        for index, trainer in enumerate(agent.trainers):
+            checkpoint_items[f'actor_{index}'] = trainer.actor
+            checkpoint_items[f'critic_{index}'] = trainer.critic
+            checkpoint_items[f'optimizer_{index}'] = trainer.optimizer
+    if config.value_normalization:
+        saved_normalizers = set()
+        for index, trainer in enumerate(agent.trainers):
+            normalizer = trainer.value_normalizer
+            if normalizer is None or id(normalizer) in saved_normalizers:
+                continue
+            saved_normalizers.add(id(normalizer))
+            checkpoint_items[f'value_norm_mean_{index}'] = normalizer.mean
+            checkpoint_items[f'value_norm_variance_{index}'] = normalizer.variance
+            checkpoint_items[f'value_norm_count_{index}'] = normalizer.count
     train_checkpointer = common.Checkpointer(
-        ckpt_dir=str(experiment_paths['checkpoints']), max_to_keep=3, actor_network=agent.actor,
-        critic_network=agent.critic, optimizer=agent.optimizer,       
-        global_step=train_step_counter, heatmap_globale_a=heatmap_globale_a, heatmap_globale_b=heatmap_globale_b
+        ckpt_dir=str(experiment_paths['checkpoints']),
+        max_to_keep=3,
+        **checkpoint_items,
     )
 
     train_checkpointer.initialize_or_restore()
@@ -174,9 +336,22 @@ def train_agent(experiment_name=None, config=None, output_dir=None):
         # --- Hyperparameter and curriculum update ---
         current_entropy = entropy_scheduler.step(current_global_step)
 
-        if current_global_step >= config.curriculum_threshold and not hard_mode_activated:
+        if (
+            config.environment == 'hunt'
+            and current_global_step >= config.curriculum_threshold
+            and not hard_mode_activated
+        ):
             print(">>> CURRICULUM LEARNING: Difficulty increased! Unforgiving stag enabled.")
-            py_env.set_stag_run_away_after_maul(False)
+            py_env, tf_env, memory, curriculum_time_step = _activate_curriculum(
+                config,
+                py_env,
+                tf_env,
+                memory,
+                agent,
+                is_parallel,
+            )
+            if curriculum_time_step is not None:
+                time_step = curriculum_time_step
             hard_mode_activated = True
 
         # --- A. Data collection ---
@@ -195,8 +370,8 @@ def train_agent(experiment_name=None, config=None, output_dir=None):
         memory.clear_buffer()
         training_metrics.append({
             'return': float(custom_return.numpy()),
-            'agent_a_return': float(agent_returns[0].numpy()),
-            'agent_b_return': float(agent_returns[1].numpy()),
+            'agent_a_return': float(tf.reduce_mean(agent_returns[:, 0]).numpy()),
+            'agent_b_return': float(tf.reduce_mean(agent_returns[:, 1]).numpy()),
             'loss': float(train_loss.numpy() if hasattr(train_loss, 'numpy') else train_loss),
             'entropy': float(current_entropy),
             'stags_caught': float(stats['stags']),
@@ -216,8 +391,16 @@ def train_agent(experiment_name=None, config=None, output_dir=None):
             tf.summary.scalar('Loss/Total_Loss', train_loss, step=current_global_step)
             tf.summary.scalar('Loss/Entropy_Coefficient', current_entropy, step=current_global_step)
             tf.summary.scalar('Metrics/Custom_Average_Return', custom_return, step=current_global_step)
-            tf.summary.scalar('Metrics/Agent_A_Return', agent_returns[0], step=current_global_step)
-            tf.summary.scalar('Metrics/Agent_B_Return', agent_returns[1], step=current_global_step)
+            tf.summary.scalar(
+                'Metrics/Agent_A_Return',
+                tf.reduce_mean(agent_returns[:, 0]),
+                step=current_global_step,
+            )
+            tf.summary.scalar(
+                'Metrics/Agent_B_Return',
+                tf.reduce_mean(agent_returns[:, 1]),
+                step=current_global_step,
+            )
             tf.summary.scalar('Training/Learning_Rate', current_learning_rate, step=current_global_step)
             tf.summary.scalar('Behavior/Stags_Caught', stats['stags'], step=current_global_step)
             tf.summary.scalar('Behavior/Plants_Eaten', stats['plants'], step=current_global_step)
@@ -235,6 +418,9 @@ def train_agent(experiment_name=None, config=None, output_dir=None):
         if step > 0 and step % config.save_interval == 0:
             train_checkpointer.save(global_step=step)
             gc.collect()
+
+    if is_parallel:
+        py_env.close()
 
     total_stags = sum(iteration['stags_caught'] for iteration in training_metrics)
     total_plants = sum(iteration['plants_eaten'] for iteration in training_metrics)
@@ -291,6 +477,11 @@ if __name__ == "__main__":
     )
     parser.add_argument('--num-iterations', type=int)
     parser.add_argument('--rollout-steps', type=int)
+    parser.add_argument('--num-parallel-envs', type=int)
+    parser.add_argument('--environment', choices=sorted(ENVIRONMENT_IDS))
+    parser.add_argument('--agent-architecture', choices=sorted(MultiAgentPPO.VALID_ARCHITECTURES))
+    parser.add_argument('--critic-observation', choices=('local', 'joint'))
+    parser.add_argument('--reward-sharing-coef', type=float)
     parser.add_argument('--minibatch-size', type=int)
     parser.add_argument('--ppo-epochs', type=int)
     parser.add_argument('--curriculum-threshold', type=int)
@@ -300,6 +491,12 @@ if __name__ == "__main__":
     parser.add_argument('--learning-rate', type=float)
     parser.add_argument('--learning-rate-end', type=float)
     parser.add_argument('--clip-epsilon', type=float)
+    parser.add_argument('--value-loss-coef', type=float)
+    parser.add_argument('--value-normalization', action='store_true', default=None)
+    parser.add_argument('--value-clipping', action='store_true', default=None)
+    parser.add_argument('--value-clip-epsilon', type=float)
+    parser.add_argument('--gamma', type=float)
+    parser.add_argument('--gae-lambda', type=float)
     parser.add_argument('--entropy-start', type=float)
     parser.add_argument('--entropy-end', type=float)
     parser.add_argument('--entropy-decay-steps', type=int)

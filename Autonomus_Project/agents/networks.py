@@ -70,7 +70,7 @@ class CriticNetwork(network.Network):
     Neural network responsible for evaluating the state (The Value Function).
     Maps the flattened coordinate observation to a single expected return value.
     """
-    def __init__(self, input_tensor_spec, hidden_sizes=(128, 128)):
+    def __init__(self, input_tensor_spec, hidden_sizes=(128, 128), output_size=1):
         super().__init__(
             input_tensor_spec=input_tensor_spec,
             state_spec=(),
@@ -78,10 +78,11 @@ class CriticNetwork(network.Network):
         )
         
         self._hidden_layers = [_orthogonal_layer(size, math.sqrt(2.0)) for size in hidden_sizes]
+        self._output_size = output_size
             
         # Output layer is a single linear node
         self._value_output = tf.keras.layers.Dense(
-            1, 
+            output_size,
             activation=None,
             kernel_initializer=tf.keras.initializers.Orthogonal(gain=1.0),
             bias_initializer=tf.keras.initializers.Zeros(),
@@ -97,8 +98,9 @@ class CriticNetwork(network.Network):
             
         value = self._value_output(x, training=training)
         
-        # The critic must return the value as a tuple (outputs, state).
-        # Remove the dimension added by Dense(1).
-        value = tf.squeeze(value, axis=-1)
+        # Keep one value per agent for centralized critics and scalar values
+        # for local critics.
+        if self._output_size == 1:
+            value = tf.squeeze(value, axis=-1)
         
         return value, network_state

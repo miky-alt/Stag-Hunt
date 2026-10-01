@@ -14,5 +14,6 @@ class EntropyScheduler:
                 self.start_value - self.end_value
             )
 
-        self.agent.entropy_coef.assign(new_entropy)
+        for trainer in self.agent.trainers:
+            trainer.entropy_coef.assign(new_entropy)
         return new_entropy
