@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.pyc
+*.egg-info/
+build/
+venv/
+.venv/
+.pytest_cache/
+.ipynb_checkpoints/
+
+# Experiment outputs (regenerate with scripts/run_final_<game>.py)
+experiments/
+final_results/
+checkpoints/
+training_logs/
+*.log
+training_*_output.txt
+
+# Not part of the published project
+analysis/
+docs/
+report/
+
+# Local files
+toDo.txt
+.env
