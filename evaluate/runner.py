@@ -1,6 +1,5 @@
 """Evaluates a trained experiment (or the uniform-random floor) and writes evaluation_results.json."""
 import json
-import os
 import time
 from pathlib import Path
 
@@ -19,12 +18,15 @@ EPISODE_MAX_STEPS = 100
 POLICIES = ('checkpoint', 'random_uniform')
 
 
-def _environment_kwargs(environment, hyperparameters, grid_size):
+def _environment_kwargs(environment, hyperparameters, grid_size, render=False):
     """Wrapper options that reproduce the training game (plus an optional grid override)."""
     kwargs = {
         # Older Hunt runs always used the handcrafted radar and have no field in metadata.
         'handcrafted_features': bool(hyperparameters.get('handcrafted_features', environment == 'hunt')),
     }
+    if render:
+        # PyGame grid window (same renderer as the upstream Gym-Stag-Hunt demos).
+        kwargs['load_renderer'] = True
     if environment == 'hunt':
         kwargs['stag_follows'] = bool(hyperparameters.get('stag_follows', True))
         kwargs['run_away_after_maul'] = bool(hyperparameters.get('run_away_after_maul', False))
@@ -50,7 +52,6 @@ def _validate(policy, episodes_per_seed, render_delay, checkpoint_step, grid_siz
 
 
 def _render(base_py_env, step_count=None, action=None, step_rewards=None, delay=0.0):
-    os.system('cls' if os.name == 'nt' else 'clear')
     base_py_env.env.render()
     if step_count is not None:
         print(f"Step: {step_count} | Selected actions: {action.numpy()} | Immediate rewards: {step_rewards.tolist()}")
@@ -116,7 +117,7 @@ def evaluate_agent(
     hyperparameters = metadata['hyperparameters']
     environment = hyperparameters.get('environment', 'hunt')
     env_name = resolve_environment_id(environment)
-    environment_kwargs = _environment_kwargs(environment, hyperparameters, grid_size)
+    environment_kwargs = _environment_kwargs(environment, hyperparameters, grid_size, render)
     print(f"Experiment: {metadata['experiment_id']}")
     print(f"Evaluation policy: {policy}")
     print(f"Hyperparameters: {json.dumps(hyperparameters, sort_keys=True)}")
