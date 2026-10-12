@@ -133,6 +133,8 @@ python -m training.train --experiment-name my_run --resume-experiment
 python -m evaluate.evaluate --experiment <experiment_dir> --seeds 101,202,303 --episodes-per-seed 10
 python -m evaluate.evaluate --experiment <experiment_dir> --deterministic --output-file evaluation_results_greedy.json
 python -m evaluate.evaluate --experiment <experiment_dir> --policy random_uniform --output-file random.json
+# watch the agents play in the PyGame grid window (as in the upstream Gym-Stag-Hunt demos)
+python -m evaluate.evaluate --experiment <experiment_dir> --seeds 101 --episodes-per-seed 3 --render --render-delay 0.2
 # inspect behaviour totals and position heatmaps
 python -m evaluate.analyze_heatmap --experiment <experiment_dir> --source evaluation
 ```
